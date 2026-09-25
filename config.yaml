@@ -1,20 +1,20 @@
-# Ranný podcast – konfigurácia
+# Ranný podcast – nastavenia
 # Zmeny sa prejavia pri najbližšej vygenerovanej epizóde.
 
 podcast:
   title: "Ranný brief"
   language: sk
-  keep_episodes: 14          # staršie epizódy sa mažú z R2 aj z feedu
+  keep_episodes: 14          # koľko posledných epizód ostane vo feede
 
 episode:
-  max_words: 1300            # ≈ 9–10 minút pri bežnom tempe TTS
+  max_words: 1300            # ≈ 9–10 minút
   lookback_hours: 24         # z akého obdobia brať správy
-  model: gemini-3.8-flash      # free tier cez Google AI Studio
+  model: gemini-3.8-flash    # zadarmo cez Google AI Studio
   fallback_model: gemini-3.7-flash
 
 tts:
-  provider: azure
   voice: sk-SK-LukasNeural   # alternatíva: sk-SK-ViktoriaNeural
+  rate: "+0%"                # rýchlosť reči, napr. "+10%"
   bitrate: 64k
 
 topics:

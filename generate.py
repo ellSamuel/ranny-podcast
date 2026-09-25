@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Ranný podcast: RSS -> Gemini (scenár) -> Azure TTS -> MP3 + feed.xml na Cloudflare R2.
+"""Ranný podcast: RSS -> Gemini (scenár) -> edge-tts (hlas) -> MP3 + feed.xml pre GitHub Pages.
 
-Spustenie:  python generate.py            (produkcia, upload na R2)
-            python generate.py --dry-run  (bez R2, výstup do ./out)
+Výstup ide do priečinka ./site, ktorý workflow nasadí na GitHub Pages.
+Predchádzajúce epizódy sa pri každom behu stiahnu zo živej stránky (PAGES_URL).
+Bez PAGES_URL beží lokálne a začína od nuly.
 """
 
-import argparse
+import asyncio
 import html
 import json
 import os
@@ -22,11 +23,10 @@ from urllib.parse import quote
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
-import boto3
+import edge_tts
 import feedparser
 import requests
 import yaml
-from botocore.exceptions import ClientError
 from google import genai
 from google.genai import types
 
@@ -167,7 +167,7 @@ def write_script(cfg, news, previous_titles, focus):
                 raise
 
 
-# ---------- 3. Audio (Azure TTS + ffmpeg) ----------
+# ---------- 3. Audio (edge-tts + ffmpeg) ----------
 
 def chunks(text, limit=2500):
     parts, current = [], ""
@@ -181,32 +181,22 @@ def chunks(text, limit=2500):
     return parts
 
 
-def tts(text, cfg, out_path):
-    voice = cfg["tts"]["voice"]
-    lang = "-".join(voice.split("-")[:2])
-    body = escape(text)
-    if cfg["tts"].get("rate"):
-        body = f'<prosody rate="{cfg["tts"]["rate"]}">{body}</prosody>'
-    ssml = f'<speak version="1.0" xml:lang="{lang}"><voice name="{voice}">{body}</voice></speak>'
-    url = f"https://{env('AZURE_SPEECH_REGION')}.tts.speech.microsoft.com/cognitiveservices/v1"
-    headers = {
-        "Ocp-Apim-Subscription-Key": env("AZURE_SPEECH_KEY"),
-        "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm",
-        "User-Agent": "ranny-podcast",
-    }
-    for attempt in range(3):
-        r = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=120)
-        if r.ok:
-            out_path.write_bytes(r.content)
-            return
-        print(f"  ! TTS chyba {r.status_code}, skúšam znova")
-        time.sleep(5 * (attempt + 1))
-    r.raise_for_status()
-
-
 def ffmpeg(*args):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args], check=True)
+
+
+def tts(text, cfg, wav_path):
+    mp3_path = wav_path.with_suffix(".mp3")
+    for attempt in range(3):
+        try:
+            communicate = edge_tts.Communicate(text, cfg["tts"]["voice"], rate=cfg["tts"].get("rate", "+0%"))
+            asyncio.run(communicate.save(str(mp3_path)))
+            ffmpeg("-i", str(mp3_path), "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(wav_path))
+            return
+        except Exception as e:
+            print(f"  ! TTS chyba ({e}), skúšam znova")
+            time.sleep(10 * (attempt + 1))
+    raise SystemExit("Hlas sa nepodarilo vygenerovať.")
 
 
 def build_audio(script, cfg, workdir):
@@ -229,55 +219,33 @@ def build_audio(script, cfg, workdir):
     return mp3.read_bytes(), round(float(probe.stdout))
 
 
-# ---------- 4. Úložisko (R2 alebo lokálne) + feed ----------
+# ---------- 4. Stránka (GitHub Pages) + feed ----------
 
-class Storage:
-    def __init__(self, dry_run=False):
-        self.local = Path("out") if dry_run else None
-        if self.local:
-            self.local.mkdir(exist_ok=True)
-            self.prefix, self.base = "", self.local.resolve().as_uri()
-            return
-        self.prefix = env("FEED_TOKEN") + "/"
-        self.base = env("R2_PUBLIC_URL").rstrip("/")
-        self.bucket = env("R2_BUCKET")
-        self.s3 = boto3.client(
-            "s3",
-            endpoint_url=f"https://{env('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
-            aws_access_key_id=env("R2_ACCESS_KEY_ID"),
-            aws_secret_access_key=env("R2_SECRET_ACCESS_KEY"),
-            region_name="auto",
-        )
+SITE = Path("site")
 
-    def url(self, key):
-        return f"{self.base}/{self.prefix}{key}"
 
-    def read_json(self, key, default):
+def load_previous(base, keep):
+    """Stiahne zoznam a MP3 predchádzajúcich epizód zo živej stránky."""
+    if not base:
+        return []
+    try:
+        r = requests.get(f"{base}/episodes.json", params={"t": int(time.time())}, timeout=30)
+        episodes = r.json() if r.ok else []
+    except (requests.RequestException, ValueError):
+        episodes = []
+    kept = []
+    for ep in episodes[: keep - 1]:
         try:
-            if self.local:
-                return json.loads((self.local / key).read_text(encoding="utf-8"))
-            return json.loads(self.s3.get_object(Bucket=self.bucket, Key=self.prefix + key)["Body"].read())
-        except FileNotFoundError:
-            return default
-        except ClientError as e:
-            if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-                return default
-            raise
-
-    def write(self, key, data, content_type, cache="no-cache"):
-        if self.local:
-            path = self.local / key
+            r = requests.get(f"{base}/{ep['key']}", timeout=120)
+        except requests.RequestException:
+            continue
+        if r.ok:
+            path = SITE / ep["key"]
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-            return
-        self.s3.put_object(Bucket=self.bucket, Key=self.prefix + key, Body=data,
-                           ContentType=content_type, CacheControl=cache)
-
-    def delete(self, key):
-        if self.local:
-            (self.local / key).unlink(missing_ok=True)
-        else:
-            self.s3.delete_object(Bucket=self.bucket, Key=self.prefix + key)
+            path.write_bytes(r.content)
+            kept.append(ep)
+    print(f"Predchádzajúce epizódy: {len(kept)}")
+    return kept
 
 
 def show_notes_html(script):
@@ -288,12 +256,12 @@ def show_notes_html(script):
     return f"<p>Zdroje:</p><ul>{links}</ul>"
 
 
-def build_feed(cfg, episodes, storage):
+def build_feed(cfg, episodes, base):
     p = cfg["podcast"]
     rss = ET.Element("rss", {"version": "2.0"})
     ch = ET.SubElement(rss, "channel")
     ET.SubElement(ch, "title").text = p["title"]
-    ET.SubElement(ch, "link").text = storage.url("feed.xml")
+    ET.SubElement(ch, "link").text = f"{base}/feed.xml"
     ET.SubElement(ch, "language").text = p.get("language", "sk")
     ET.SubElement(ch, "description").text = p.get("description", "Súkromný ranný súhrn správ.")
     ET.SubElement(ch, f"{{{ITUNES}}}author").text = p["title"]
@@ -307,7 +275,7 @@ def build_feed(cfg, episodes, storage):
         ET.SubElement(item, "description").text = ep["description"]
         ET.SubElement(item, "pubDate").text = ep["pub_date"]
         ET.SubElement(item, "guid", {"isPermaLink": "false"}).text = ep["guid"]
-        ET.SubElement(item, "enclosure", {"url": storage.url(ep["key"]), "length": str(ep["length"]),
+        ET.SubElement(item, "enclosure", {"url": f"{base}/{ep['key']}", "length": str(ep["length"]),
                                           "type": "audio/mpeg"})
         ET.SubElement(item, f"{{{ITUNES}}}duration").text = str(ep["duration"])
     return ET.tostring(rss, encoding="utf-8", xml_declaration=True)
@@ -316,15 +284,13 @@ def build_feed(cfg, episodes, storage):
 # ---------- main ----------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="bez uploadu na R2, výstup do ./out")
-    args = parser.parse_args()
-
     cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
     focus = os.environ.get("FOCUS", "").strip()
     on_demand = os.environ.get("RUN_KIND") == "workflow_dispatch"
-    storage = Storage(args.dry_run)
-    episodes = storage.read_json("episodes.json", [])
+    base = os.environ.get("PAGES_URL", "").rstrip("/")
+    SITE.mkdir(exist_ok=True)
+    keep = cfg["podcast"].get("keep_episodes", 14)
+    episodes = load_previous(base, keep)
 
     since = datetime.now(timezone.utc) - timedelta(hours=cfg["episode"].get("lookback_hours", 24))
     seen = {u for ep in episodes[:3] for u in ep.get("used_urls", [])}
@@ -341,13 +307,15 @@ def main():
         audio, duration = build_audio(script, cfg, Path(tmp))
 
     now = datetime.now(TZ)
-    date = f"{now.day}. {now.month}." + (f" {now:%H:%M}" if on_demand else "")
     guid = str(uuid.uuid4())
     key = f"episodes/{now:%Y-%m-%d-%H%M}-{guid[:8]}.mp3"
-    storage.write(key, audio, "audio/mpeg", cache="public, max-age=31536000")
-    if args.dry_run:
-        storage.write("script.json", json.dumps(script, ensure_ascii=False, indent=2).encode(), "application/json")
+    (SITE / "episodes").mkdir(exist_ok=True)
+    (SITE / key).write_bytes(audio)
+    if not base:
+        (SITE / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
+        base = SITE.resolve().as_uri()
 
+    date = f"{now.day}. {now.month}." + (f" {now:%H:%M}" if on_demand else "")
     episodes.insert(0, {
         "guid": guid,
         "title": f"{date} – {script['title']}",
@@ -358,14 +326,11 @@ def main():
         "duration": duration,
         "used_urls": [it["url"] for items in news.values() for it in items],
     })
-    keep = cfg["podcast"].get("keep_episodes", 14)
-    for old in episodes[keep:]:
-        storage.delete(old["key"])
-    episodes = episodes[:keep]
-
-    storage.write("episodes.json", json.dumps(episodes, ensure_ascii=False, indent=1).encode(), "application/json")
-    storage.write("feed.xml", build_feed(cfg, episodes, storage), "application/rss+xml; charset=utf-8")
-    print(f"Hotovo: {episodes[0]['title']} ({duration // 60}:{duration % 60:02d})")
+    (SITE / "episodes.json").write_text(json.dumps(episodes, ensure_ascii=False, indent=1), encoding="utf-8")
+    (SITE / "feed.xml").write_bytes(build_feed(cfg, episodes, base))
+    (SITE / "index.html").write_text(f'<meta charset="utf-8"><p>{html.escape(cfg["podcast"]["title"])}: '
+                                     f'<a href="feed.xml">feed.xml</a></p>', encoding="utf-8")
+    print(f"Hotovo: {episodes[0]['title']} ({duration // 60}:{duration % 60:02d}) -> {base}/feed.xml")
 
 
 if __name__ == "__main__":
