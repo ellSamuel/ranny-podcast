@@ -1,5 +1,5 @@
-anthropic
 boto3
 feedparser
+google-genai
 pyyaml
 requests
