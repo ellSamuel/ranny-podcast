@@ -9,7 +9,8 @@ podcast:
 episode:
   max_words: 1300            # ≈ 9–10 minút pri bežnom tempe TTS
   lookback_hours: 24         # z akého obdobia brať správy
-  model: claude-sonnet-5
+  model: gemini-3.8-flash      # free tier cez Google AI Studio
+  fallback_model: gemini-3.7-flash
 
 tts:
   provider: azure
