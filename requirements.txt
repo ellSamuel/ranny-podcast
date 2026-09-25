@@ -1,0 +1,5 @@
+anthropic
+boto3
+feedparser
+pyyaml
+requests
