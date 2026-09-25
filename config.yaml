@@ -9,8 +9,10 @@ podcast:
 episode:
   max_words: 1300            # ≈ 9–10 minút
   lookback_hours: 24         # z akého obdobia brať správy
-  model: gemini-3.8-flash    # zadarmo cez Google AI Studio
-  fallback_model: gemini-3.7-flash
+  models:                    # skúšajú sa v tomto poradí (zadarmo cez Google AI Studio)
+    - gemini-3.6-flash
+    - gemini-3.8-flash
+    - gemini-3.5-flash-lite
 
 tts:
   voice: sk-SK-LukasNeural   # alternatíva: sk-SK-ViktoriaNeural

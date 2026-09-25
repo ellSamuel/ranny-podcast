@@ -33,6 +33,7 @@ from google.genai import types
 TZ = ZoneInfo("Europe/Zurich")
 ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 ET.register_namespace("itunes", ITUNES)
+RETRY_WAITS = [0, 60, 180, 300]  # sekundy pred každým kolom pokusov
 WEEKDAYS = ["pondelok", "utorok", "streda", "štvrtok", "piatok", "sobota", "nedeľa"]
 
 
@@ -145,26 +146,27 @@ def write_script(cfg, news, previous_titles, focus):
         f"Správy podľa tém (JSON):\n{json.dumps(news, ensure_ascii=False)}"
     )
     client = genai.Client(api_key=env("GEMINI_API_KEY"))
-    models = [ep.get("model", "gemini-3.8-flash")] + ([ep["fallback_model"]] if ep.get("fallback_model") else [])
-    for i, model in enumerate(models):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM.format(max_words=ep["max_words"]),
-                    response_mime_type="application/json",
-                    response_json_schema=EPISODE_SCHEMA,
-                    max_output_tokens=16000,
-                ),
-            )
-            script = json.loads(response.text)
-            print(f"Model: {model}")
-            return script
-        except Exception as e:  # limit, výpadok alebo nevalidný JSON -> skús záložný model
-            print(f"  ! {model} zlyhal: {e}")
-            if i == len(models) - 1:
-                raise
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM.format(max_words=ep["max_words"]),
+        response_mime_type="application/json",
+        response_json_schema=EPISODE_SCHEMA,
+        max_output_tokens=16000,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+    # Bezplatné modely bývajú občas preťažené (503) -> skúšaj modely postupne, v niekoľkých kolách s čakaním.
+    for wait in RETRY_WAITS:
+        if wait:
+            print(f"  … modely sú preťažené, čakám {wait // 60} min a skúsim znova")
+            time.sleep(wait)
+        for model in ep["models"]:
+            try:
+                response = client.models.generate_content(model=model, contents=prompt, config=config)
+                script = json.loads(response.text)
+                print(f"Model: {model}")
+                return script
+            except Exception as e:
+                print(f"  ! {model}: {str(e)[:150]}")
+    raise SystemExit("Gemini je momentálne nedostupné. Skús spustiť workflow neskôr.")
 
 
 # ---------- 3. Audio (edge-tts + ffmpeg) ----------
