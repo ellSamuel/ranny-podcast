@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Ranný podcast: RSS -> Gemini (scenár) -> edge-tts (hlas) -> MP3 + feed.xml pre GitHub Pages.
+"""Ranný podcast: RSS -> Gemini (scenár + lekcia nemčiny) -> edge-tts (hlas) -> MP3 s kapitolami + feed.xml pre GitHub Pages.
 
 Výstup ide do priečinka ./site, ktorý workflow nasadí na GitHub Pages.
-Predchádzajúce epizódy sa pri každom behu stiahnu zo živej stránky (PAGES_URL).
+Predchádzajúce epizódy a história naučených fráz sa pri každom behu stiahnu zo živej stránky (PAGES_URL).
 Bez PAGES_URL beží lokálne a začína od nuly.
 """
 
@@ -10,11 +10,14 @@ import asyncio
 import html
 import json
 import os
+import random
 import re
+import shutil
 import subprocess
 import tempfile
 import time
 import uuid
+import wave
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -35,6 +38,11 @@ ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 ET.register_namespace("itunes", ITUNES)
 RETRY_WAITS = [0, 60, 180, 300]  # sekundy pred každým kolom pokusov
 WEEKDAYS = ["pondelok", "utorok", "streda", "štvrtok", "piatok", "sobota", "nedeľa"]
+RATE = 24000  # vzorkovanie všetkých WAV kúskov (musia byť rovnaké, aby sa dali zlepiť)
+GAP = 0.8  # ticho medzi kapitolami, v sekundách
+ORDINALS = ["Prvá", "Druhá", "Tretia", "Štvrtá", "Piata", "Šiesta", "Siedma", "Ôsma", "Deviata", "Desiata"]
+REVIEW_PLAN = ((1, 3), (3, 2), (7, 2), (14, 1))  # (pred koľkými lekciami, koľko fráz z nej zopakovať)
+KEEP_LESSONS = 100  # koľko posledných lekcií si história pamätá
 
 
 def env(name):
@@ -51,22 +59,27 @@ def clean(text, limit=400):
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
-def topic_feed_urls(topic):
-    urls = list(topic.get("feeds", []))
-    gn = topic.get("google_news")
-    if gn:
+def google_news_urls(topic):
+    searches = topic.get("google_news") or []
+    urls = []
+    for gn in ([searches] if isinstance(searches, dict) else searches):
         hl, gl = gn.get("hl", "sk"), gn.get("gl", "SK")
         q = quote(f'{gn["query"]} when:1d')
         urls.append(f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={gl}:{hl}")
     return urls
 
 
-def collect(topic, since, seen_urls, max_items=40):
+def fetch_items(urls, since, seen_urls):
     items = []
-    for url in topic_feed_urls(topic):
-        feed = feedparser.parse(url, agent="ranny-podcast/1.0")
+    for url in urls:
+        try:
+            response = requests.get(url, headers={"User-Agent": "ranny-podcast/1.0"}, timeout=20)
+        except requests.RequestException:
+            print(f"  ! feed nefunguje: {url[:100]}")
+            continue
+        feed = feedparser.parse(response.content)
         if feed.bozo and not feed.entries:
-            print(f"  ! feed nefunguje: {url}")
+            print(f"  ! feed nefunguje: {url[:100]}")
             continue
         for e in feed.entries:
             ts = e.get("published_parsed") or e.get("updated_parsed")
@@ -75,17 +88,43 @@ def collect(topic, since, seen_urls, max_items=40):
             if (published and published < since) or link in seen_urls:
                 continue
             source = (e.get("source") or {}).get("title") or feed.feed.get("title", url)
+            title = clean(e.get("title"), 200)
+            if title.endswith(f" - {source}"):  # Google News pripája k titulku názov zdroja
+                title = title[: -len(source) - 3]
             items.append({
-                "title": clean(e.get("title"), 200),
+                "title": title,
                 "summary": clean(e.get("summary")),
                 "source": source,
                 "url": link,
                 "published": published.isoformat() if published else "",
             })
-    unique = {}
+    return items
+
+
+def pick(items, limit, max_per_source, taken):
+    """Od najnovších, bez duplicít (`taken` sú už použité titulky) a s limitom správ na vydavateľa."""
+    picked, per_source = [], {}
     for it in sorted(items, key=lambda x: x["published"], reverse=True):
-        unique.setdefault(it["title"].lower(), it)
-    return list(unique.values())[:max_items]
+        title = it["title"].lower()
+        if title in taken or per_source.get(it["source"], 0) >= max_per_source:
+            continue
+        taken.add(title)
+        per_source[it["source"]] = per_source.get(it["source"], 0) + 1
+        picked.append(it)
+        if len(picked) == limit:
+            break
+    return picked
+
+
+def collect(topic, since, seen_urls, ep):
+    """Správy z vybraných feedov majú prednosť. Google News dopĺňa širší výber zo sveta s vlastným limitom."""
+    per_source = ep.get("max_per_source", 6)
+    taken = set()
+    curated = pick(fetch_items(topic.get("feeds", []), since, seen_urls),
+                   ep.get("max_items", 60), per_source, taken)
+    searched = pick(fetch_items(google_news_urls(topic), since, seen_urls),
+                    ep.get("max_search_items", 30), per_source, taken)
+    return curated + searched
 
 
 # ---------- 2. Scenár (Gemini) ----------
@@ -93,18 +132,21 @@ def collect(topic, since, seen_urls, max_items=40):
 EPISODE_SCHEMA = {
     "type": "object",
     "properties": {
-        "title": {"type": "string", "description": "Krátky titulok (max 70 znakov) s 2–3 hlavnými témami dňa."},
-        "sections": {
+        "title": {"type": "string", "description": "Krátky titulok (max 70 znakov) s 2–3 hlavnými správami dňa."},
+        "intro": {"type": "string", "description": "Pozdrav s dňom a dátumom a jedna veta o tom, čo dnes zaznie."},
+        "topics": {
             "type": "array",
+            "description": "Jedna položka pre každú tému v danom poradí.",
             "items": {
                 "type": "object",
                 "properties": {"heading": {"type": "string"}, "text": {"type": "string"}},
                 "required": ["heading", "text"],
             },
         },
+        "outro": {"type": "string", "description": "Jedna-dve vety na rozlúčku."},
         "show_notes": {
             "type": "array",
-            "description": "5–15 najdôležitejších použitých zdrojov.",
+            "description": "8–20 najdôležitejších použitých zdrojov.",
             "items": {
                 "type": "object",
                 "properties": {"title": {"type": "string"}, "url": {"type": "string"}},
@@ -112,45 +154,95 @@ EPISODE_SCHEMA = {
             },
         },
     },
-    "required": ["title", "sections", "show_notes"],
+    "required": ["title", "intro", "topics", "outro", "show_notes"],
 }
 
-SYSTEM = """Si moderátor krátkeho ranného spravodajského podcastu pre jedného poslucháča.
+GERMAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "theme": {"type": "string", "description": "Téma dnešnej lekcie po slovensky, 2–5 slov."},
+        "intro": {"type": "string", "description": "Jedna-dve vety po slovensky: čo sa dnes naučíme a načo sa to hodí."},
+        "phrases": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "de": {"type": "string", "description": "Fráza po nemecky."},
+                    "sk": {"type": "string", "description": "Prirodzený slovenský ekvivalent."},
+                    "tip": {"type": "string", "description": "1–2 vety po slovensky, bez nemeckých slov."},
+                    "example_de": {"type": "string", "description": "Krátka ukážková veta s frázou."},
+                    "example_sk": {"type": "string", "description": "Preklad ukážkovej vety."},
+                },
+                "required": ["de", "sk", "tip", "example_de", "example_sk"],
+            },
+        },
+    },
+    "required": ["theme", "intro", "phrases"],
+}
+
+SYSTEM = """Si moderátor krátkeho ranného podcastu pre jedného poslucháča: správy zo sveta a lekcia nemčiny.
 Text bude čítať syntetický slovenský hlas, takže píšeš na počúvanie, nie na čítanie.
 
-Pravidlá:
+Pravidlá pre správy:
 - Spisovná, ale hovorová slovenčina. Krátke vety, prirodzené prechody medzi správami.
-- Spolu najviac {max_words} slov. Čas rozdeľ medzi témy podľa uvedených podielov.
-- Prvá sekcia: krátky pozdrav s dňom a dátumom a jedna veta o tom, čo dnes zaznie.
-  Potom jedna sekcia pre každú tému v danom poradí. Posledná sekcia: jedna-dve vety na rozlúčku.
+- Polia intro, topics a outro majú spolu najviac {news_words} slov. Čas rozdeľ medzi témy podľa uvedených podielov.
+- intro: krátky pozdrav s dňom a dátumom a jedna veta o tom, čo dnes zaznie{german_hint}.
+- topics: presne jedna položka pre každú tému v danom poradí; heading je názov kapitoly uvedený pri téme.
+- outro: jedna-dve vety na rozlúčku.
+- Správy prichádzajú z médií a agentúr z celého sveta a v rôznych jazykoch (slovensky, anglicky, nemecky, ukrajinsky, poľsky, japonsky…). Prelož ich do slovenčiny.
+- Zdrojov je veľa. Vyber to najdôležitejšie a neopieraj sa o jediný zdroj. Ak tú istú správu potvrdzuje viac nezávislých zdrojov, spomeň to. Ak sa zdroje rozchádzajú, povedz to a uveď obe verzie. Pri dôležitých tvrdeniach pomenuj zdroj (napr. „podľa Reuters“, „píše Kyiv Independent“).
+- Uprednostni etablované a dôveryhodné zdroje (agentúry, verejnoprávne a renomované médiá). Správu z neznámeho, bulvárneho alebo agregátorského webu použi iba vtedy, ak ju potvrdzuje spoľahlivejší zdroj, inak ju výslovne označ ako nepotvrdenú.
 - Používaj iba informácie z dodaných správ. Nič si nevymýšľaj. Ak k téme nie je nič podstatné, povedz to jednou vetou.
 - Rumors a neoverené správy vždy výslovne označ a povedz, kto s nimi prišiel.
 - Tvrdenia strán konfliktu pripisuj konkrétnej strane.
 - Čísla, dátumy, meny a skratky vypíš slovami tak, ako sa vyslovujú. Anglické názvy produktov nechaj.
-- Žiadny markdown, odrážky, emoji ani URL v texte sekcií.
+- Žiadny markdown, odrážky, emoji ani URL v texte.
 - Neopakuj to, čo už bolo v predchádzajúcich epizódach, pokiaľ nie je podstatný posun."""
 
+GERMAN_RULES = """
 
-def write_script(cfg, news, previous_titles, focus):
+Pravidlá pre lekciu nemčiny (pole german):
+- Poslucháč je Slovák, úroveň: {level}. Učí sa počúvaním a opakovaním nahlas. Slovenský hlas číta iba slovenský text, nemecké frázy číta samostatný nemecký hlas.
+- Vyber {phrases} NOVÝCH fráz, ktoré sa v bežnom živote používajú najčastejšie (pozdravy, zdvorilosť, orientácia, jedlo, nakupovanie, doprava, zoznamovanie, práca). Frázy jednej lekcie patria k jednej téme. Postupuj od najčastejších a najjednoduchších k ťažším.
+- de: celá fráza alebo krátka veta v štandardnej nemčine, správny pravopis a interpunkcia. sk: prirodzený slovenský ekvivalent (nie doslovný preklad, ak znie nepodarene).
+- tip: 1–2 vety po slovensky o tom, kedy sa fráza používa (formálne/neformálne) alebo na čo dať pozor. V tipe nepíš nemecké slová.
+- example_de a example_sk: jedna krátka ukážková veta s frázou a jej preklad.
+- Nemecké slová nepíš do polí intro, topics ani outro.{notes}"""
+
+
+def write_script(cfg, news, previous_titles, focus, taught, news_words):
     now = datetime.now(TZ)
     ep = cfg["episode"]
+    german = cfg.get("german")
     topics = "\n".join(
-        f'- {t["name"]} (~{round(t["share"] * 100)} % času)' + (f': {t["notes"]}' if t.get("notes") else "")
+        f'- {t["name"]} (kapitola „{t.get("chapter", t["name"])}“, ~{round(t["share"] * 100)} % času)'
+        + (f': {t["notes"]}' if t.get("notes") else "")
         for t in cfg["topics"]
     )
+    schema, system = EPISODE_SCHEMA, SYSTEM.format(
+        news_words=news_words, german_hint=", vrátane lekcie nemčiny" if german else "")
+    if german:
+        schema = {**schema, "properties": {**schema["properties"], "german": GERMAN_SCHEMA},
+                  "required": [*schema["required"], "german"]}
+        system += GERMAN_RULES.format(
+            level=german.get("level", "A1"),
+            phrases=german.get("phrases", 6),
+            notes=f"\n- {german['notes']}" if german.get("notes") else "",
+        )
     prompt = (
         f"Dnes je {WEEKDAYS[now.weekday()]} {now.day}. {now.month}. {now.year}, {now:%H:%M}.\n\n"
         f"Témy v poradí:\n{topics}\n\n"
         + (f"Jednorazový dôraz pre túto epizódu: {focus}\n\n" if focus else "")
         + f"Titulky predchádzajúcich epizód: {json.dumps(previous_titles, ensure_ascii=False)}\n\n"
-        f"Správy podľa tém (JSON):\n{json.dumps(news, ensure_ascii=False)}"
+        + (f"Už naučené nemecké frázy (nezopakuj ich): {json.dumps(taught, ensure_ascii=False)}\n\n" if german else "")
+        + f"Správy podľa tém (JSON):\n{json.dumps(news, ensure_ascii=False)}"
     )
     client = genai.Client(api_key=env("GEMINI_API_KEY"))
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM.format(max_words=ep["max_words"]),
+        system_instruction=system,
         response_mime_type="application/json",
-        response_json_schema=EPISODE_SCHEMA,
-        max_output_tokens=16000,
+        response_json_schema=schema,
+        max_output_tokens=24000,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
     # Bezplatné modely bývajú občas preťažené (503) -> skúšaj modely postupne, v niekoľkých kolách s čakaním.
@@ -167,6 +259,26 @@ def write_script(cfg, news, previous_titles, focus):
             except Exception as e:
                 print(f"  ! {model}: {str(e)[:150]}")
     raise SystemExit("Gemini je momentálne nedostupné. Skús spustiť workflow neskôr.")
+
+
+def pick_lesson(raw, cfg, lessons):
+    """Z odpovede modelu ponechá iba frázy, ktoré ešte neboli, a oreže ich na nastavený počet."""
+    if not raw:
+        return None
+    taught = {p["de"].lower() for lesson in lessons for p in lesson["phrases"]}
+    limit = min(cfg["german"].get("phrases", 6), len(ORDINALS))
+    fresh = [p for p in raw["phrases"] if p["de"].strip() and p["de"].lower() not in taught]
+    return {**raw, "phrases": fresh[:limit]} if fresh else None
+
+
+def pick_review(lessons):
+    """Náhodne vyberie frázy z lekcií spred 1, 3, 7 a 14 lekcií (rozložené opakovanie)."""
+    review = []
+    for ago, count in REVIEW_PLAN:
+        if ago <= len(lessons):
+            phrases = lessons[ago - 1]["phrases"]
+            review += random.sample(phrases, min(count, len(phrases)))
+    return review
 
 
 # ---------- 3. Audio (edge-tts + ffmpeg) ----------
@@ -187,13 +299,13 @@ def ffmpeg(*args):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args], check=True)
 
 
-def tts(text, cfg, wav_path):
+def tts(text, voice, rate, wav_path):
     mp3_path = wav_path.with_suffix(".mp3")
     for attempt in range(3):
         try:
-            communicate = edge_tts.Communicate(text, cfg["tts"]["voice"], rate=cfg["tts"].get("rate", "+0%"))
+            communicate = edge_tts.Communicate(text, voice, rate=rate)
             asyncio.run(communicate.save(str(mp3_path)))
-            ffmpeg("-i", str(mp3_path), "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(wav_path))
+            ffmpeg("-i", str(mp3_path), "-ar", str(RATE), "-ac", "1", "-c:a", "pcm_s16le", str(wav_path))
             return
         except Exception as e:
             print(f"  ! TTS chyba ({e}), skúšam znova")
@@ -201,24 +313,141 @@ def tts(text, cfg, wav_path):
     raise SystemExit("Hlas sa nepodarilo vygenerovať.")
 
 
-def build_audio(script, cfg, workdir):
-    pause = workdir / "pause.wav"
-    ffmpeg("-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono", "-t", "0.8", "-c:a", "pcm_s16le", str(pause))
-    wavs = []
-    for i, section in enumerate(script["sections"]):
-        for j, part in enumerate(chunks(section["text"])):
-            wav = workdir / f"s{i:02d}_{j:02d}.wav"
-            tts(part, cfg, wav)
-            wavs.append(wav)
-        wavs.append(pause)
-    listing = workdir / "list.txt"
-    listing.write_text("".join(f"file '{p}'\n" for p in wavs))
-    mp3 = workdir / "episode.mp3"
-    ffmpeg("-f", "concat", "-safe", "0", "-i", str(listing), "-ac", "1",
-           "-b:a", cfg["tts"].get("bitrate", "64k"), str(mp3))
-    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(mp3)],
-                           capture_output=True, text=True, check=True)
-    return mp3.read_bytes(), round(float(probe.stdout))
+def wav_seconds(path):
+    with wave.open(str(path)) as w:
+        return w.getnframes() / w.getframerate()
+
+
+def ffmetadata(chapters, total):
+    """Kapitoly vo formáte ffmpeg metadát. Každá trvá do začiatku ďalšej."""
+    lines = [";FFMETADATA1"]
+    ends = [start for start, _ in chapters[1:]] + [total]
+    for (start, title), end in zip(chapters, ends):
+        escaped = re.sub(r"([=;#\\\n])", r"\\\1", title)
+        lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={round(start * 1000)}", f"END={round(end * 1000)}",
+                  f"title={escaped}"]
+    return "\n".join(lines) + "\n"
+
+
+class Track:
+    """Skladá epizódu z replík a ticha a počíta si čas, aby vedela, kde začína ktorá kapitola.
+
+    Hlas sa zadáva ako dvojica (názov hlasu, rýchlosť). Bez neho číta slovenský hlas.
+    """
+
+    def __init__(self, cfg, workdir):
+        self.dir = workdir
+        self.sk = (cfg["tts"]["voice"], cfg["tts"].get("rate", "+0%"))
+        german = cfg.get("german", {})
+        self.de = (german.get("voice", "de-DE-KatjaNeural"), "+0%")
+        self.de_slow = (self.de[0], german.get("slow_rate", "-35%"))
+        self.clips = []  # WAV kúsky v poradí prehrávania
+        self.time = 0.0  # sekundy od začiatku epizódy
+        self.last = 0.0  # dĺžka poslednej repliky, podľa nej sa počíta pauza na opakovanie
+        self.chapters = []  # (sekundy, názov)
+        self.cache = {}  # rovnaká replika sa syntetizuje iba raz
+
+    def mark(self, title):
+        self.chapters.append((self.time, title))
+
+    def say(self, text, voice=None):
+        voice = voice or self.sk
+        for part in chunks(text):
+            if (voice, part) not in self.cache:
+                wav = self.dir / f"clip{len(self.clips):04d}.wav"
+                tts(part, *voice, wav)
+                self.cache[voice, part] = (wav, wav_seconds(wav))
+            wav, seconds = self.cache[voice, part]
+            self.clips.append(wav)
+            self.time += seconds
+            self.last = seconds
+
+    def pause(self, seconds):
+        frames = round(RATE * seconds)
+        wav = self.dir / f"clip{len(self.clips):04d}.wav"
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(bytes(2 * frames))
+        self.clips.append(wav)
+        self.time += frames / RATE
+
+    def echo(self):
+        """Ticho na zopakovanie práve vypočutej repliky nahlas."""
+        self.pause(self.last * 1.3 + 0.8)
+
+    def export(self, bitrate):
+        listing = self.dir / "list.txt"
+        listing.write_text("".join(f"file '{p}'\n" for p in self.clips))
+        meta = self.dir / "chapters.txt"
+        meta.write_text(ffmetadata(self.chapters, self.time), encoding="utf-8")
+        mp3 = self.dir / "episode.mp3"
+        ffmpeg("-f", "concat", "-safe", "0", "-i", str(listing), "-i", str(meta), "-map", "0:a",
+               "-map_metadata", "1", "-map_chapters", "1", "-id3v2_version", "3",
+               "-ac", "1", "-b:a", bitrate, str(mp3))
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                                str(mp3)], capture_output=True, text=True, check=True)
+        return mp3.read_bytes(), round(float(probe.stdout))
+
+
+def sentence(text):
+    text = text.strip()
+    return text if text[-1:] in ".!?…" else text + "."
+
+
+def quiz(track, phrases):
+    """Slovensky zadanie, ticho na odpoveď, potom správna nemecká odpoveď."""
+    for p in phrases:
+        track.say(sentence(p["sk"]))
+        track.pause(2.5 + 0.7 * len(p["de"].split()))
+        track.say(p["de"], track.de)
+        track.pause(0.8)
+
+
+def add_lesson(track, cfg, lesson, review):
+    track.mark(cfg["german"].get("chapter", "Nemčina"))
+    track.say(f"Teraz nemčina. Dnešná téma: {lesson['theme']}. {lesson['intro']} "
+              "Po každej nemeckej fráze bude chvíľa ticha. Zopakuj ju nahlas.")
+    if review:
+        track.say("Najprv opakovanie. Skús povedať po nemecky:")
+        quiz(track, review)
+    track.say("A teraz nové frázy.")
+    for i, p in enumerate(lesson["phrases"]):
+        track.say(f"{ORDINALS[i]} fráza: {sentence(p['sk'])} Po nemecky:")
+        track.say(p["de"], track.de)
+        track.echo()
+        track.say(p["de"], track.de_slow)
+        track.echo()
+        track.say(p["tip"])
+        track.say("Napríklad:")
+        track.say(p["example_de"], track.de)
+        track.say(p["example_sk"])
+        track.pause(GAP)
+    track.say("Overme si, čo sme sa naučili. Ako sa povie po nemecky:")
+    quiz(track, random.sample(lesson["phrases"], len(lesson["phrases"])))
+
+
+def build_audio(script, lesson, review, cfg, workdir):
+    track = Track(cfg, workdir)
+    track.mark("Úvod")
+    track.say(script["intro"])
+    for topic in script["topics"]:
+        track.pause(GAP)
+        track.mark(topic["heading"])
+        track.say(topic["text"])
+    if lesson:
+        track.pause(GAP)
+        add_lesson(track, cfg, lesson, review)
+    track.pause(GAP)
+    track.say(script["outro"])
+    audio, duration = track.export(cfg["tts"].get("bitrate", "64k"))
+    return audio, duration, track.chapters
+
+
+def spoken_words(script):
+    texts = [script["intro"], script["outro"], *(t["text"] for t in script["topics"])]
+    return sum(len(text.split()) for text in texts)
 
 
 # ---------- 4. Stránka (GitHub Pages) + feed ----------
@@ -226,17 +455,21 @@ def build_audio(script, cfg, workdir):
 SITE = Path("site")
 
 
-def load_previous(base, keep):
-    """Stiahne zoznam a MP3 predchádzajúcich epizód zo živej stránky."""
+def fetch_json(base, name):
+    """Stiahne JSON zo živej stránky. Bez stránky alebo súboru vráti prázdny zoznam."""
     if not base:
         return []
     try:
-        r = requests.get(f"{base}/episodes.json", params={"t": int(time.time())}, timeout=30)
-        episodes = r.json() if r.ok else []
+        r = requests.get(f"{base}/{name}", params={"t": int(time.time())}, timeout=30)
+        return r.json() if r.ok else []
     except (requests.RequestException, ValueError):
-        episodes = []
+        return []
+
+
+def load_previous(base, keep):
+    """Stiahne zoznam a MP3 predchádzajúcich epizód zo živej stránky."""
     kept = []
-    for ep in episodes[: keep - 1]:
+    for ep in fetch_json(base, "episodes.json")[: keep - 1]:
         try:
             r = requests.get(f"{base}/{ep['key']}", timeout=120)
         except requests.RequestException:
@@ -250,12 +483,16 @@ def load_previous(base, keep):
     return kept
 
 
-def show_notes_html(script):
+def show_notes_html(script, lesson):
     links = "".join(
         f'<li><a href="{html.escape(n["url"], quote=True)}">{html.escape(n["title"])}</a></li>'
         for n in script["show_notes"]
     )
-    return f"<p>Zdroje:</p><ul>{links}</ul>"
+    notes = f"<p>Zdroje:</p><ul>{links}</ul>"
+    if lesson:
+        phrases = "".join(f"<li>{html.escape(p['de'])} – {html.escape(p['sk'])}</li>" for p in lesson["phrases"])
+        notes = f"<p>Nemčina – {html.escape(lesson['theme'])}:</p><ul>{phrases}</ul>" + notes
+    return notes
 
 
 def build_feed(cfg, episodes, base):
@@ -269,8 +506,13 @@ def build_feed(cfg, episodes, base):
     ET.SubElement(ch, f"{{{ITUNES}}}author").text = p["title"]
     ET.SubElement(ch, f"{{{ITUNES}}}explicit").text = "false"
     ET.SubElement(ch, f"{{{ITUNES}}}block").text = "Yes"
-    if p.get("cover_url"):
-        ET.SubElement(ch, f"{{{ITUNES}}}image", {"href": p["cover_url"]})
+    if p.get("cover"):
+        cover_url = f"{base}/{Path(p['cover']).name}"
+        ET.SubElement(ch, f"{{{ITUNES}}}image", {"href": cover_url})
+        image = ET.SubElement(ch, "image")  # pre aplikácie, ktoré itunes:image nečítajú
+        ET.SubElement(image, "url").text = cover_url
+        ET.SubElement(image, "title").text = p["title"]
+        ET.SubElement(image, "link").text = f"{base}/feed.xml"
     for ep in episodes:
         item = ET.SubElement(ch, "item")
         ET.SubElement(item, "title").text = ep["title"]
@@ -285,6 +527,29 @@ def build_feed(cfg, episodes, base):
 
 # ---------- main ----------
 
+def make_episode(cfg, news, previous_titles, focus, lessons):
+    """Vygeneruje scenár a audio. Ak epizóda prekročí limit, skráti scenár a skúsi to ešte raz."""
+    limit = cfg["episode"]["max_minutes"] * 60
+    news_words = cfg["episode"]["news_words"]
+    taught = [p["de"] for lesson in lessons for p in lesson["phrases"]]
+    review = pick_review(lessons)
+    for attempt in range(2):
+        script = write_script(cfg, news, previous_titles, focus, taught, news_words)
+        lesson = pick_lesson(script.get("german"), cfg, lessons) if cfg.get("german") else None
+        words = spoken_words(script)
+        print(f"Scenár: {script['title']} ({words} slov)")
+        with tempfile.TemporaryDirectory() as tmp:
+            audio, duration, chapters = build_audio(script, lesson, review if lesson else [], cfg, Path(tmp))
+        if duration <= limit or attempt:
+            if duration > limit:
+                print(f"  ! epizóda je dlhšia ako limit ({duration // 60}:{duration % 60:02d})")
+            return script, lesson, audio, duration, chapters
+        lesson_seconds = duration - chapters[-1][0] if lesson else 0  # lekcia má pevnú dĺžku, krátia sa správy
+        news_words = max(300, int(words * (limit - lesson_seconds) / (duration - lesson_seconds) * 0.95))
+        print(f"  … epizóda má {duration // 60}:{duration % 60:02d}, limit je {limit // 60}:00. "
+              f"Skúšam scenár na {news_words} slov")
+
+
 def main():
     cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
     focus = os.environ.get("FOCUS", "").strip()
@@ -293,20 +558,18 @@ def main():
     SITE.mkdir(exist_ok=True)
     keep = cfg["podcast"].get("keep_episodes", 14)
     episodes = load_previous(base, keep)
+    lessons = fetch_json(base, "german.json") if cfg.get("german") else []
 
     since = datetime.now(timezone.utc) - timedelta(hours=cfg["episode"].get("lookback_hours", 24))
     seen = {u for ep in episodes[:3] for u in ep.get("used_urls", [])}
-    news = {t["name"]: collect(t, since, seen) for t in cfg["topics"]}
+    news = {t["name"]: collect(t, since, seen, cfg["episode"]) for t in cfg["topics"]}
     print("Počet správ:", {name: len(items) for name, items in news.items()})
     if not any(news.values()):
         raise SystemExit("Žiadne nové správy, epizódu negenerujem.")
 
-    script = write_script(cfg, news, [ep["title"] for ep in episodes[:3]], focus)
-    words = sum(len(s["text"].split()) for s in script["sections"])
-    print(f"Scenár: {script['title']} ({words} slov)")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        audio, duration = build_audio(script, cfg, Path(tmp))
+    script, lesson, audio, duration, chapters = make_episode(
+        cfg, news, [ep["title"] for ep in episodes[:3]], focus, lessons)
+    print("Kapitoly:", ", ".join(f"{int(start) // 60}:{int(start) % 60:02d} {title}" for start, title in chapters))
 
     now = datetime.now(TZ)
     guid = str(uuid.uuid4())
@@ -316,12 +579,21 @@ def main():
     if not base:
         (SITE / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
         base = SITE.resolve().as_uri()
+    if cfg["podcast"].get("cover"):
+        shutil.copyfile(cfg["podcast"]["cover"], SITE / Path(cfg["podcast"]["cover"]).name)
+
+    if cfg.get("german"):  # stránka sa nasadzuje celá odznova, história sa musí zapísať pri každom behu
+        if lesson:
+            lessons.insert(0, {"date": f"{now:%Y-%m-%d}", "theme": lesson["theme"],
+                               "phrases": [{"de": p["de"], "sk": p["sk"]} for p in lesson["phrases"]]})
+        (SITE / "german.json").write_text(json.dumps(lessons[:KEEP_LESSONS], ensure_ascii=False, indent=1),
+                                          encoding="utf-8")
 
     date = f"{now.day}. {now.month}." + (f" {now:%H:%M}" if on_demand else "")
     episodes.insert(0, {
         "guid": guid,
         "title": f"{date} – {script['title']}",
-        "description": show_notes_html(script),
+        "description": show_notes_html(script, lesson),
         "pub_date": format_datetime(now),
         "key": key,
         "length": len(audio),

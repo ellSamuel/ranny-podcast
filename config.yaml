@@ -5,10 +5,15 @@ podcast:
   title: "Ranný brief"
   language: sk
   keep_episodes: 14          # koľko posledných epizód ostane vo feede
+  cover: cover.jpg           # obrázok podcastu (JPEG/PNG, 1400–3000 px), nasadí sa spolu s feedom
 
 episode:
-  max_words: 1300            # ≈ 9–10 minút
+  max_minutes: 20            # tvrdý strop dĺžky; dlhšia epizóda sa vygeneruje znova s kratším scenárom
+  news_words: 1800           # slová pre správy (≈ 13 min); zvyšok epizódy je lekcia nemčiny (≈ 5 min)
   lookback_hours: 24         # z akého obdobia brať správy
+  max_per_source: 6          # najviac správ od jedného vydavateľa, aby jeden zdroj nezaplavil ostatné
+  max_items: 60              # najviac správ na tému z vybraných feedov (tie majú prednosť)
+  max_search_items: 30       # najviac správ na tému z Google News dotazov (širší, menej preverený výber)
   models:                    # skúšajú sa v tomto poradí (zadarmo cez Google AI Studio)
     - gemini-3.6-flash
     - gemini-3.8-flash
@@ -19,26 +24,81 @@ tts:
   rate: "+0%"                # rýchlosť reči, napr. "+10%"
   bitrate: 64k
 
+# Každá téma je v podcaste samostatná kapitola (v aplikácii ju preskočíš tlačidlom ďalšia kapitola).
+# Zdroje: vlastné RSS feedy + Google News dotazy (pomocou nich sa dostanú aj agentúry bez RSS,
+# napr. Reuters a AP, a médiá v iných jazykoch; model ich prekladá do slovenčiny).
 topics:
   - name: "Apple – novinky a rumors"
+    chapter: "Apple"
     share: 0.40
     notes: "Rumors vždy označ ako rumors a uveď pôvodný zdroj (napr. Mark Gurman / Bloomberg)."
     feeds:
       - https://www.apple.com/newsroom/rss-feed.rss
+      - https://developer.apple.com/news/rss/news.rss
       - https://feeds.macrumors.com/MacRumors-All
       - https://9to5mac.com/feed/
+      - https://appleinsider.com/rss/news/
+      - https://www.theverge.com/rss/apple/index.xml
+      - https://feeds.arstechnica.com/arstechnica/apple
+      - https://daringfireball.net/feeds/main
+      - https://sixcolors.com/feed/
+      - https://www.macstories.net/feed/
+      - https://www.macworld.com/feed
+      - https://www.iphone-ticker.de/feed/
+    google_news:
+      - {query: "Apple Gurman OR Kuo OR rumor OR leak", hl: en, gl: US}
+      - {query: "Apple iPhone Mac", hl: de, gl: DE}
+      - {query: "Apple iPhone", hl: ja, gl: JP}
 
   - name: "Slovensko – politika a dôležité udalosti"
+    chapter: "Slovensko"
     share: 0.35
+    notes: "Uveď, ako o dianí píšu slovenské aj zahraničné médiá. Vyvážene predstav pohľad vlády aj opozície."
+    feeds:
+      - https://www.sme.sk/rss-title
+      - https://dennikn.sk/feed/
+      - https://www.aktuality.sk/rss/
+      - https://spravy.pravda.sk/rss/xml/
+      - https://spravy.stvr.sk/feed/
+      - https://hnonline.sk/rss
+      - https://dennikstandard.sk/feed/
+      - https://www.postoj.sk/rss
+      - https://euractiv.sk/rss
+      - https://spectator.sme.sk/rss
     google_news:
-      query: "Slovensko vláda OR parlament OR politika"
-      hl: sk
-      gl: SK
+      - {query: "Slovensko vláda OR parlament OR politika", hl: sk, gl: SK}
+      - {query: "Slovakia Fico OR government OR parliament", hl: en, gl: US}
+      - {query: "Slovensko Fico vláda", hl: cs, gl: CZ}
+      - {query: "Slowakei Fico Regierung", hl: de, gl: DE}
 
   - name: "Vojna Rusko–Ukrajina"
+    chapter: "Ukrajina"
     share: 0.25
-    notes: "Vývoj na fronte, diplomacia, pomoc Ukrajine. Tvrdenia strán konfliktu uvádzaj s pripísaním."
+    notes: "Vývoj na fronte, diplomacia, pomoc Ukrajine. Porovnaj ukrajinské, západné a nezávislé ruské zdroje; tvrdenia strán konfliktu uvádzaj s pripísaním."
+    feeds:
+      - https://www.theguardian.com/world/ukraine/rss
+      - https://kyivindependent.com/news-archive/rss
+      - https://www.pravda.com.ua/eng/rss/
+      - https://www.ukrinform.net/rss/block-lastnews
+      - https://english.nv.ua/rss/all.xml
+      - https://meduza.io/rss/en/all
+      - https://www.themoscowtimes.com/rss/news
     google_news:
-      query: "Ukrajina Rusko vojna"
-      hl: sk
-      gl: SK
+      - {query: "Ukraine Russia war (site:reuters.com OR site:apnews.com)", hl: en, gl: US}
+      - {query: "Ukraine Russia war (site:bbc.com OR site:nytimes.com OR site:ft.com OR site:washingtonpost.com OR site:aljazeera.com OR site:dw.com OR site:france24.com OR site:economist.com)", hl: en, gl: US}
+      - {query: "Russian Offensive Campaign Assessment site:understandingwar.org", hl: en, gl: US}
+      - {query: "Україна війна фронт", hl: uk, gl: UA}
+      - {query: "Ukraine Krieg Front", hl: de, gl: DE}
+      - {query: "Ukraina wojna", hl: pl, gl: PL}
+      - {query: "Ukrajina Rusko vojna", hl: sk, gl: SK}
+
+# Štvrtá téma: lekcia nemčiny. Je vždy posledná kapitola (pred rozlúčkou) a nie je z RSS.
+# Každá epizóda: opakovanie starších fráz -> nové frázy (počúvaj, zopakuj, pomaly, príklad) -> záverečný test.
+# Už naučené frázy si epizódy pamätajú, takže sa neopakujú; staršie sa vracajú na opakovanie.
+german:
+  chapter: "Nemčina"
+  level: "A1 – úplný začiatočník"
+  phrases: 6                 # koľko nových fráz v jednej epizóde (najviac 10)
+  voice: de-DE-KatjaNeural   # alternatívy: de-DE-ConradNeural, švajčiarska nemčina de-CH-LeniNeural
+  slow_rate: "-35%"          # rýchlosť pomalého opakovania
+  notes: "Opieraj sa o osnovy a frekvenčné zoznamy uznávaných inštitúcií (Goethe-Institut A1–A2, Profile Deutsch, Duden, DW Nicos Weg). Ak sa hodí, spomeň švajčiarsku variantu (napr. Grüezi), ale učíme štandardnú nemčinu."
