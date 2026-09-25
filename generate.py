@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ranný podcast: RSS -> Claude (scenár) -> Azure TTS -> MP3 + feed.xml na Cloudflare R2.
+"""Ranný podcast: RSS -> Gemini (scenár) -> Azure TTS -> MP3 + feed.xml na Cloudflare R2.
 
 Spustenie:  python generate.py            (produkcia, upload na R2)
             python generate.py --dry-run  (bez R2, výstup do ./out)
@@ -22,12 +22,13 @@ from urllib.parse import quote
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
-import anthropic
 import boto3
 import feedparser
 import requests
 import yaml
 from botocore.exceptions import ClientError
+from google import genai
+from google.genai import types
 
 TZ = ZoneInfo("Europe/Zurich")
 ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
@@ -86,35 +87,31 @@ def collect(topic, since, seen_urls, max_items=40):
     return list(unique.values())[:max_items]
 
 
-# ---------- 2. Scenár (Claude) ----------
+# ---------- 2. Scenár (Gemini) ----------
 
-EPISODE_TOOL = {
-    "name": "episode",
-    "description": "Odovzdaj hotový scenár epizódy.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "title": {"type": "string", "description": "Krátky titulok (max 70 znakov) s 2–3 hlavnými témami dňa."},
-            "sections": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {"heading": {"type": "string"}, "text": {"type": "string"}},
-                    "required": ["heading", "text"],
-                },
-            },
-            "show_notes": {
-                "type": "array",
-                "description": "5–15 najdôležitejších použitých zdrojov.",
-                "items": {
-                    "type": "object",
-                    "properties": {"title": {"type": "string"}, "url": {"type": "string"}},
-                    "required": ["title", "url"],
-                },
+EPISODE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "Krátky titulok (max 70 znakov) s 2–3 hlavnými témami dňa."},
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"heading": {"type": "string"}, "text": {"type": "string"}},
+                "required": ["heading", "text"],
             },
         },
-        "required": ["title", "sections", "show_notes"],
+        "show_notes": {
+            "type": "array",
+            "description": "5–15 najdôležitejších použitých zdrojov.",
+            "items": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}, "url": {"type": "string"}},
+                "required": ["title", "url"],
+            },
+        },
     },
+    "required": ["title", "sections", "show_notes"],
 }
 
 SYSTEM = """Si moderátor krátkeho ranného spravodajského podcastu pre jedného poslucháča.
@@ -147,16 +144,27 @@ def write_script(cfg, news, previous_titles, focus):
         + f"Titulky predchádzajúcich epizód: {json.dumps(previous_titles, ensure_ascii=False)}\n\n"
         f"Správy podľa tém (JSON):\n{json.dumps(news, ensure_ascii=False)}"
     )
-    client = anthropic.Anthropic()
-    msg = client.messages.create(
-        model=ep.get("model", "claude-sonnet-5"),
-        max_tokens=8000,
-        system=SYSTEM.format(max_words=ep["max_words"]),
-        tools=[EPISODE_TOOL],
-        tool_choice={"type": "tool", "name": "episode"},
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return next(block.input for block in msg.content if block.type == "tool_use")
+    client = genai.Client(api_key=env("GEMINI_API_KEY"))
+    models = [ep.get("model", "gemini-3.8-flash")] + ([ep["fallback_model"]] if ep.get("fallback_model") else [])
+    for i, model in enumerate(models):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM.format(max_words=ep["max_words"]),
+                    response_mime_type="application/json",
+                    response_json_schema=EPISODE_SCHEMA,
+                    max_output_tokens=16000,
+                ),
+            )
+            script = json.loads(response.text)
+            print(f"Model: {model}")
+            return script
+        except Exception as e:  # limit, výpadok alebo nevalidný JSON -> skús záložný model
+            print(f"  ! {model} zlyhal: {e}")
+            if i == len(models) - 1:
+                raise
 
 
 # ---------- 3. Audio (Azure TTS + ffmpeg) ----------
