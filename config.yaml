@@ -1,0 +1,41 @@
+# Ranný podcast – konfigurácia
+# Zmeny sa prejavia pri najbližšej vygenerovanej epizóde.
+
+podcast:
+  title: "Ranný brief"
+  language: sk
+  keep_episodes: 14          # staršie epizódy sa mažú z R2 aj z feedu
+
+episode:
+  max_words: 1300            # ≈ 9–10 minút pri bežnom tempe TTS
+  lookback_hours: 24         # z akého obdobia brať správy
+  model: claude-sonnet-5
+
+tts:
+  provider: azure
+  voice: sk-SK-LukasNeural   # alternatíva: sk-SK-ViktoriaNeural
+  bitrate: 64k
+
+topics:
+  - name: "Apple – novinky a rumors"
+    share: 0.40
+    notes: "Rumors vždy označ ako rumors a uveď pôvodný zdroj (napr. Mark Gurman / Bloomberg)."
+    feeds:
+      - https://www.apple.com/newsroom/rss-feed.rss
+      - https://feeds.macrumors.com/MacRumors-All
+      - https://9to5mac.com/feed/
+
+  - name: "Slovensko – politika a dôležité udalosti"
+    share: 0.35
+    google_news:
+      query: "Slovensko vláda OR parlament OR politika"
+      hl: sk
+      gl: SK
+
+  - name: "Vojna Rusko–Ukrajina"
+    share: 0.25
+    notes: "Vývoj na fronte, diplomacia, pomoc Ukrajine. Tvrdenia strán konfliktu uvádzaj s pripísaním."
+    google_news:
+      query: "Ukrajina Rusko vojna"
+      hl: sk
+      gl: SK
